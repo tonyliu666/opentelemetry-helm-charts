@@ -16,8 +16,8 @@ icon: https://opentelemetry.io/img/logos/opentelemetry-logo-nav.png
 appVersion: 2.2.0
 dependencies:
   - name: opentelemetry-collector
-    version: 0.142.2
-    repository: https://open-telemetry.github.io/opentelemetry-helm-charts
+    version: 0.147.1
+    repository: file://../opentelemetry-collector
     condition: opentelemetry-collector.enabled
   - name: jaeger
     version: 4.3.0

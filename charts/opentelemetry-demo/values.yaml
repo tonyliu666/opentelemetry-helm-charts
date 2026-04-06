@@ -917,6 +917,8 @@ opentelemetry-collector:
       enabled: true
     clusterMetrics:
       enabled: true
+    kubernetesEvents:
+      enabled: true
     annotationDiscovery:
       metrics:
         enabled: true

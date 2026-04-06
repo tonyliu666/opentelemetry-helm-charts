@@ -1,7 +1,7 @@
 dependencies:
 - name: opentelemetry-collector
-  repository: https://open-telemetry.github.io/opentelemetry-helm-charts
-  version: 0.142.2
+  repository: file://../opentelemetry-collector
+  version: 0.147.1
 - name: jaeger
   repository: https://jaegertracing.github.io/helm-charts
   version: 4.3.0
@@ -14,5 +14,5 @@ dependencies:
 - name: opensearch
   repository: https://opensearch-project.github.io/helm-charts/
   version: 3.4.0
-digest: sha256:0f09debb8c88db66bf60c0111505ca82ab132bc5d81f87463e1e7eed5e326717
-generated: "2026-01-15T14:00:28.521863+01:00"
+digest: sha256:4347df3d46cec9fb70dfd73c77f457e44fa8d9ae90bc2499d9258f0c66fbcbf1
+generated: "2026-04-06T14:35:45.01380143+08:00"
