@@ -198,7 +198,7 @@ config:
               exporter:
                 prometheus:
                   host: ${env:MY_POD_IP}
-                  port: 8888
+                  port: 888
     extensions:
       - health_check
     pipelines:

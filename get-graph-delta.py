@@ -58,18 +58,40 @@ def open_db(path, reset=False):
     return conn
 
 
-def load_hashes(conn):
-    return {row[0]: row[1] for row in conn.execute("SELECT id, hash FROM nodes")}
+def load_nodes(conn):
+    """Return the stored snapshot as {id: {"hash", "kind", "name", "details"}}."""
+    stored = {}
+    for nid, kind, name, digest, details in conn.execute(
+        "SELECT id, kind, name, hash, details FROM nodes"
+    ):
+        try:
+            parsed = json.loads(details)
+        except ValueError:
+            parsed = {}
+        stored[nid] = {"hash": digest, "kind": kind, "name": name, "details": parsed}
+    return stored
 
 
 def save_nodes(conn, nodes):
+    """Replace the snapshot with the freshly rendered set.
+
+    Rows absent from this render are deleted, otherwise a resource that was
+    removed from the chart would be reported as `removed` on every later run.
+    """
+    rows = [
+        (n["id"], n["kind"], n["name"], n["hash"], json.dumps(n["details"], sort_keys=True))
+        for n in nodes
+    ]
     conn.executemany(
         "INSERT OR REPLACE INTO nodes (id, kind, name, hash, details) VALUES (?, ?, ?, ?, ?)",
-        [
-            (n["id"], n["kind"], n["name"], n["hash"], json.dumps(n["details"], sort_keys=True))
-            for n in nodes
-        ],
+        rows,
     )
+    current = [row[0] for row in rows]
+    if current:
+        placeholders = ",".join("?" * len(current))
+        conn.execute("DELETE FROM nodes WHERE id NOT IN (%s)" % placeholders, current)
+    else:
+        conn.execute("DELETE FROM nodes")
     conn.commit()
 
 
@@ -418,16 +440,84 @@ def compute_edges(nodes):
     return edges
 
 
-def compute_delta(nodes, known_hashes, audit_all=False):
-    """Return (changed_ids, impacted_edges) after one hop of impact expansion."""
+def key_of(item, index):
+    """Index list entries by their `name` when they have one, else by position."""
+    if isinstance(item, dict) and item.get("name") is not None:
+        return "name=%s" % item["name"]
+    return "[%d]" % index
+
+
+def diff_details(old, new, path=""):
+    """Recursively diff two extracted-detail trees into a flat change list.
+
+    Lists of named objects (containers, ports, volume mounts) are matched by
+    name rather than by position, so reordering is not reported as a change.
+    """
+    changes = []
+
+    if isinstance(old, dict) and isinstance(new, dict):
+        for key in sorted(set(old) | set(new)):
+            child = "%s.%s" % (path, key) if path else key
+            if key not in old:
+                changes.append({"path": child, "old": None, "new": new[key]})
+            elif key not in new:
+                changes.append({"path": child, "old": old[key], "new": None})
+            else:
+                changes.extend(diff_details(old[key], new[key], child))
+        return changes
+
+    if isinstance(old, list) and isinstance(new, list):
+        old_map = {key_of(item, i): item for i, item in enumerate(old)}
+        new_map = {key_of(item, i): item for i, item in enumerate(new)}
+        for key in sorted(set(old_map) | set(new_map)):
+            child = "%s.%s" % (path, key) if path else key
+            if key not in old_map:
+                changes.append({"path": child, "old": None, "new": new_map[key]})
+            elif key not in new_map:
+                changes.append({"path": child, "old": old_map[key], "new": None})
+            else:
+                changes.extend(diff_details(old_map[key], new_map[key], child))
+        return changes
+
+    if old != new:
+        changes.append({"path": path or ".", "old": old, "new": new})
+    return changes
+
+
+def compute_delta(nodes, stored, audit_all=False):
+    """Classify every node against the snapshot and expand one hop of impact.
+
+    Returns (delta_ids, impacted_edges, change_types, changes_by_id, removed).
+    """
     edges = compute_edges(nodes)
 
     if audit_all:
-        return set(nodes), edges
+        return (
+            set(nodes),
+            edges,
+            {nid: "baseline" for nid in nodes},
+            {},
+            [],
+        )
 
-    changed = {
-        nid for nid, node in nodes.items() if known_hashes.get(nid) != node["hash"]
-    }
+    change_types = {}
+    changes_by_id = {}
+    changed = set()
+    for nid, node in nodes.items():
+        previous = stored.get(nid)
+        if previous is None:
+            change_types[nid] = "added"
+            changed.add(nid)
+        elif previous["hash"] != node["hash"]:
+            change_types[nid] = "modified"
+            changes_by_id[nid] = diff_details(previous["details"], node["details"])
+            changed.add(nid)
+
+    removed = [
+        {"id": nid, "kind": previous["kind"], "name": previous["name"]}
+        for nid, previous in sorted(stored.items())
+        if nid not in nodes
+    ]
 
     # Impact analysis: pull in the neighbour on any edge touching a changed node,
     # so a renamed label surfaces together with the Service that points at it.
@@ -439,13 +529,16 @@ def compute_delta(nodes, known_hashes, audit_all=False):
             impacted_edges.append(edge)
             neighbours |= endpoints
 
-    return changed | neighbours, impacted_edges
+    for nid in neighbours - changed:
+        change_types[nid] = "impacted"
+
+    return changed | neighbours, impacted_edges, change_types, changes_by_id, removed
 
 
 # --------------------------------------------------------------------------
 # Module 4: payload generation
 # --------------------------------------------------------------------------
-def build_payload(nodes, delta_ids, impacted_edges, scope):
+def build_payload(nodes, delta_ids, impacted_edges, change_types, changes_by_id, removed, scope):
     changed_nodes = []
     for nid in sorted(delta_ids):
         node = nodes.get(nid)
@@ -454,15 +547,117 @@ def build_payload(nodes, delta_ids, impacted_edges, scope):
         entry = {"id": node["id"], "kind": node["kind"], "name": node["name"]}
         if node.get("namespace"):
             entry["namespace"] = node["namespace"]
+        entry["change_type"] = change_types.get(nid, "impacted")
+        if changes_by_id.get(nid):
+            entry["changes"] = changes_by_id[nid]
         entry["details"] = node["details"]
         changed_nodes.append(entry)
 
-    return {
+    payload = {
         "audit_scope": scope,
         "total_nodes": len(nodes),
         "changed_nodes": changed_nodes,
         "impacted_edges": impacted_edges,
     }
+    if removed:
+        payload["removed_nodes"] = removed
+    return payload
+
+
+# --------------------------------------------------------------------------
+# Human-readable diff rendering (stderr, so stdout stays machine-readable)
+# --------------------------------------------------------------------------
+MARKERS = {
+    "added": ("+", "\033[32m"),
+    "modified": ("~", "\033[33m"),
+    "impacted": ("\u00b7", "\033[36m"),
+    "baseline": ("=", "\033[36m"),
+    "removed": ("-", "\033[31m"),
+}
+RESET = "\033[0m"
+DANGLING_TYPES = {"dangling_service", "dangling_scale_target", "dangling_pdb"}
+
+
+def short(value, limit=72):
+    """Render a diff value on one line, truncated so the terminal stays readable."""
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    elif value is None:
+        text = "<absent>"
+    elif isinstance(value, bool):
+        text = "true" if value else "false"
+    else:
+        text = str(value)
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
+
+
+def render_diff(payload, stream=sys.stderr, color=None):
+    """Print the delta as a readable diff. Does not touch the JSON payload."""
+    if color is None:
+        color = stream.isatty()
+
+    def paint(text, code):
+        return "%s%s%s" % (code, text, RESET) if color else text
+
+    def line(text=""):
+        stream.write(text + "\n")
+
+    changed = payload["changed_nodes"]
+    removed = payload.get("removed_nodes") or []
+    edges = payload["impacted_edges"]
+
+    line()
+    line(
+        "k8s topology delta  [%s]  %d/%d node(s) in scope"
+        % (payload["audit_scope"], len(changed), payload["total_nodes"])
+    )
+
+    if not changed and not removed:
+        line("  (no change)")
+        line()
+        return
+
+    for node in changed:
+        change_type = node.get("change_type", "impacted")
+        marker, code = MARKERS.get(change_type, MARKERS["impacted"])
+        line("  %s %s  (%s)" % (paint(marker, code), paint(node["id"], code), change_type))
+        for change in node.get("changes") or []:
+            if change["old"] is None:
+                line("      %s: %s" % (change["path"], paint("+" + short(change["new"]), MARKERS["added"][1])))
+            elif change["new"] is None:
+                line("      %s: %s" % (change["path"], paint("-" + short(change["old"]), MARKERS["removed"][1])))
+            else:
+                line(
+                    "      %s: %s -> %s"
+                    % (
+                        change["path"],
+                        paint(short(change["old"]), MARKERS["removed"][1]),
+                        paint(short(change["new"]), MARKERS["added"][1]),
+                    )
+                )
+
+    for node in removed:
+        marker, code = MARKERS["removed"]
+        line("  %s %s  (removed)" % (paint(marker, code), paint(node["id"], code)))
+
+    if edges:
+        line()
+        line("  impacted edges:")
+        for edge in edges:
+            code = MARKERS["removed"][1] if edge["type"] in DANGLING_TYPES else MARKERS["impacted"][1]
+            line("    %s  [%s]" % (paint(edge["relation"], code), edge["type"]))
+
+    dangling = sum(1 for e in edges if e["type"] in DANGLING_TYPES)
+    summary = "  %d changed, %d removed, %d impacted edge(s)" % (
+        len(changed),
+        len(removed),
+        len(edges),
+    )
+    if dangling:
+        summary += paint(", %d dangling reference(s)" % dangling, MARKERS["removed"][1])
+    line()
+    line(summary)
+    line()
 
 
 def main(argv=None):
@@ -500,6 +695,18 @@ def main(argv=None):
         default=2,
         help="JSON indent; use 0 for compact output (default: 2)",
     )
+    parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="do not print the human-readable diff to stderr",
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="colorize the stderr diff (default: auto)",
+    )
     args = parser.parse_args(argv)
 
     if args.file:
@@ -510,10 +717,10 @@ def main(argv=None):
 
     conn = open_db(args.db, reset=args.reset)
     try:
-        known_hashes = load_hashes(conn)
-        first_run = not known_hashes
-        delta_ids, impacted_edges = compute_delta(
-            nodes, known_hashes, audit_all=args.all or first_run
+        stored = load_nodes(conn)
+        first_run = not stored
+        delta_ids, impacted_edges, change_types, changes_by_id, removed = compute_delta(
+            nodes, stored, audit_all=args.all or first_run
         )
         if not args.no_update:
             save_nodes(conn, nodes.values())
@@ -524,7 +731,15 @@ def main(argv=None):
         scope = "full-baseline"
     else:
         scope = "local-delta"
-    payload = build_payload(nodes, delta_ids, impacted_edges, scope)
+    payload = build_payload(
+        nodes, delta_ids, impacted_edges, change_types, changes_by_id, removed, scope
+    )
+
+    if not args.quiet:
+        render_diff(
+            payload,
+            color=None if args.color == "auto" else args.color == "always",
+        )
 
     json.dump(payload, sys.stdout, indent=args.indent or None, sort_keys=False)
     sys.stdout.write("\n")
